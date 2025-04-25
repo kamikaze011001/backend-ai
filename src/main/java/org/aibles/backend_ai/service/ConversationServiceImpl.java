@@ -1,10 +1,13 @@
 package org.aibles.backend_ai.service;
 
+import com.datastax.oss.driver.api.core.servererrors.QueryExecutionException;
 import lombok.extern.slf4j.Slf4j;
 import org.aibles.backend_ai.dto.ModelContextWindow;
 import org.aibles.backend_ai.dto.response.ConversationDto;
 import org.aibles.backend_ai.dto.response.ConversationMessageDto;
 import org.aibles.backend_ai.entity.*;
+import org.aibles.backend_ai.exception.DatabaseException;
+import org.aibles.backend_ai.exception.ResourceNotFoundException;
 import org.aibles.backend_ai.repository.ConversationMetadataRepo;
 import org.aibles.backend_ai.repository.ConversationRepository;
 import org.aibles.backend_ai.repository.MessageRepository;
@@ -58,40 +61,65 @@ public class ConversationServiceImpl implements ConversationService {
 
         conversation.setId(UUID.randomUUID().toString());
         conversation.setTitle(title);
-        return conversationRepository.save(conversation).flatMap(savedConversation -> {
-            ConversationMetadata metadata = ConversationMetadata
-                    .builder()
-                    .conversationId(conversation.getId())
-                    .model(model)
-                    .build();
-            return conversationMetadataRepo.save(metadata).thenReturn(savedConversation);
-        });
+        
+        return conversationRepository.save(conversation)
+            .flatMap(savedConversation -> {
+                ConversationMetadata metadata = ConversationMetadata
+                        .builder()
+                        .conversationId(conversation.getId())
+                        .model(model)
+                        .build();
+                return conversationMetadataRepo.save(metadata)
+                    .thenReturn(savedConversation);
+            })
+            .onErrorMap(e -> {
+                log.error("Error saving conversation", e);
+                if (e instanceof QueryExecutionException) {
+                    return new DatabaseException("save", "Failed to save conversation: " + e.getMessage(), e);
+                }
+                return new DatabaseException("save", "Unexpected error saving conversation", e);
+            });
     }
 
     @Override
     public Flux<ConversationDto> findConversations(Instant toTine, int limit) {
         log.info("(findLatestConversations)toTime : {}, limit : {}", toTine, limit);
         final String monthBucket = YearMonth.from(LocalDateTime.now().atZone(ZoneOffset.UTC)).format(monthYearFormatter);
-        return conversationRepository.findBy(monthBucket, toTine, limit).map(conversation ->
+        return conversationRepository.findBy(monthBucket, toTine, limit)
+            .map(conversation ->
                 ConversationDto.builder()
                         .id(conversation.getId())
                         .title(conversation.getTitle())
                         .createdAt(conversation.getKey().getCreatedAt())
                         .build()
-        );
+            )
+            .onErrorMap(e -> {
+                log.error("Error finding conversations", e);
+                return new DatabaseException("query", "Failed to find conversations: " + e.getMessage(), e);
+            });
     }
 
     @Override
     public Mono<String> findConversationModel(String id) {
         log.info("(findConversation)id : {}", id);
         return conversationMetadataRepo.findById(id)
-                .flatMap(metadata -> Mono.just(metadata.getModel()));
+                .switchIfEmpty(Mono.error(new ResourceNotFoundException("Conversation", "id", id)))
+                .flatMap(metadata -> Mono.just(metadata.getModel()))
+                .onErrorResume(ResourceNotFoundException.class, Mono::error)
+                .onErrorMap(e -> {
+                    if (e instanceof ResourceNotFoundException) {
+                        return e;
+                    }
+                    log.error("Error finding conversation model", e);
+                    return new DatabaseException("query", "Failed to find conversation model: " + e.getMessage(), e);
+                });
     }
 
     @Override
     public Flux<ConversationMessageDto> findMessagesInConversation(String conversationId, Instant toTime) {
         log.info("(findMessagesInConversation)conversationId : {}", conversationId);
         return messageRepository.findMessagesBy(conversationId, toTime, MAX_CONTEXT_MESSAGES)
+                .switchIfEmpty(Flux.error(new ResourceNotFoundException("Messages", "conversationId", conversationId)))
                 .map(conversationMessage ->
                         ConversationMessageDto.builder()
                                 .id(conversationMessage.getId())
@@ -100,7 +128,15 @@ public class ConversationServiceImpl implements ConversationService {
                                 .question(conversationMessage.getQuestion())
                                 .answer(conversationMessage.getAnswer())
                                 .build()
-                );
+                )
+                .onErrorResume(ResourceNotFoundException.class, Flux::error)
+                .onErrorMap(e -> {
+                    if (e instanceof ResourceNotFoundException) {
+                        return e;
+                    }
+                    log.error("Error finding messages in conversation", e);
+                    return new DatabaseException("query", "Failed to find messages: " + e.getMessage(), e);
+                });
     }
 
     @Override
@@ -111,23 +147,28 @@ public class ConversationServiceImpl implements ConversationService {
                 .findContextWindowByConversationId(conversationId, MAX_CONTEXT_MESSAGES)
                 .sort(Comparator.comparing(ConversationMessage::getCreatedAt));
 
-        return contextWindow.collectList().map(conversationMessages -> {
-            List<Message> messages = new ArrayList<>();
-            UserMessage userMessage;
-            AssistantMessage assistantMessage;
-            for (ConversationMessage conversationMessage : conversationMessages) {
-                userMessage = new UserMessage(conversationMessage.getQuestion());
-                assistantMessage = new AssistantMessage(conversationMessage.getAnswer());
-                messages.add(userMessage);
-                messages.add(assistantMessage);
-            }
-            messages.add(new UserMessage(newPromptMessage));
+        return contextWindow.collectList()
+            .map(conversationMessages -> {
+                List<Message> messages = new ArrayList<>();
+                UserMessage userMessage;
+                AssistantMessage assistantMessage;
+                for (ConversationMessage conversationMessage : conversationMessages) {
+                    userMessage = new UserMessage(conversationMessage.getQuestion());
+                    assistantMessage = new AssistantMessage(conversationMessage.getAnswer());
+                    messages.add(userMessage);
+                    messages.add(assistantMessage);
+                }
+                messages.add(new UserMessage(newPromptMessage));
 
-            ModelContextWindow modelContextWindow = new ModelContextWindow();
-            modelContextWindow.setModel(model);
-            modelContextWindow.setMessages(messages);
-            return modelContextWindow;
-        });
+                ModelContextWindow modelContextWindow = new ModelContextWindow();
+                modelContextWindow.setModel(model);
+                modelContextWindow.setMessages(messages);
+                return modelContextWindow;
+            })
+            .onErrorMap(e -> {
+                log.error("Error generating context window", e);
+                return new DatabaseException("query", "Failed to generate context window: " + e.getMessage(), e);
+            });
     }
 
     @Override
@@ -143,7 +184,12 @@ public class ConversationServiceImpl implements ConversationService {
         conversationMessage.setId(UUID.randomUUID().toString());
         conversationMessage.setQuestion(question);
         conversationMessage.setAnswer(answer);
-        return messageRepository.save(conversationMessage).then();
+        
+        return messageRepository.save(conversationMessage)
+            .then()
+            .onErrorMap(e -> {
+                log.error("Error saving message", e);
+                return new DatabaseException("save", "Failed to save message: " + e.getMessage(), e);
+            });
     }
-
 }

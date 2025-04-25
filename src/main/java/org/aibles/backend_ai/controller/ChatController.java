@@ -16,13 +16,15 @@ import reactor.core.publisher.Mono;
 
 import java.time.Instant;
 
+/**
+ * Controller for chat functionality, handles conversation operations.
+ */
 @Slf4j
 @RequestMapping("/api/v1")
 @RestController
 public class ChatController {
 
     private final ConversationService conversationService;
-
     private final ChatService chatService;
 
     public ChatController(ConversationService conversationService, ChatService chatService) {
@@ -30,6 +32,12 @@ public class ChatController {
         this.chatService = chatService;
     }
 
+    /**
+     * Starts a new conversation with the specified configuration
+     *
+     * @param request the start conversation request
+     * @return the created conversation details
+     */
     @PostMapping(path = "/conversations:start", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     @ResponseStatus(HttpStatus.CREATED)
     public Mono<ConversationDto> startConversation(@RequestBody @Valid StartConversationRequest request) {
@@ -37,6 +45,13 @@ public class ChatController {
         return chatService.startConversation(request);
     }
 
+    /**
+     * Streams a response for the given conversation
+     *
+     * @param id the conversation ID
+     * @param request the conversation prompt request
+     * @return a stream of the AI response
+     */
     @PostMapping(value = "/conversations/{id}:stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     @ResponseStatus(HttpStatus.OK)
     public Flux<String> streamConversation(@PathVariable("id") String id, @RequestBody @Valid ConversationRequest request) {
@@ -44,6 +59,13 @@ public class ChatController {
         return chatService.streamAnswer(id, request);
     }
 
+    /**
+     * Gets a list of conversations
+     *
+     * @param toTime the timestamp to query from
+     * @param limit the maximum number of conversations to return
+     * @return a list of conversations
+     */
     @GetMapping("/conversations")
     @ResponseStatus(HttpStatus.OK)
     public Flux<ConversationDto> get(@RequestParam Instant toTime,
@@ -52,6 +74,13 @@ public class ChatController {
         return conversationService.findConversations(toTime, limit);
     }
 
+    /**
+     * Gets the messages from a specific conversation
+     *
+     * @param id the conversation ID
+     * @param toTime the timestamp to query from
+     * @return a list of messages in the conversation
+     */
     @GetMapping("/conversations/{id}")
     @ResponseStatus(HttpStatus.OK)
     public Flux<ConversationMessageDto> getLatestMessageInConversations(

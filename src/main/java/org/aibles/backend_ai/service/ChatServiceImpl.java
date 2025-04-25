@@ -4,6 +4,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.aibles.backend_ai.dto.request.ConversationRequest;
 import org.aibles.backend_ai.dto.request.StartConversationRequest;
 import org.aibles.backend_ai.dto.response.ConversationDto;
+import org.aibles.backend_ai.exception.AIServiceException;
+import org.aibles.backend_ai.exception.ResourceNotFoundException;
 import org.aibles.backend_ai.service.chatstream.ChatStreamRegistry;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
@@ -45,7 +47,14 @@ public class ChatServiceImpl implements ChatService {
                         .id(conversation.getId())
                         .title(conversation.getTitle())
                         .createdAt(conversation.getKey().getCreatedAt())
-                         .build()));
+                         .build()))
+                .onErrorMap(error -> {
+                    log.error("Error starting conversation", error);
+                    if (error instanceof AIServiceException) {
+                        return error;
+                    }
+                    return new AIServiceException("Chat Service", "Failed to start conversation: " + error.getMessage(), error);
+                });
     }
 
     private Mono<String> generateTitlePrompt(String promptMessage) {
@@ -60,44 +69,68 @@ public class ChatServiceImpl implements ChatService {
 
         return chatModel.stream(new Prompt(List.of(systemMessage, userMessage),
                         OllamaOptions.builder().model(DEFAULT_MODEL).build()))
-                .collectList().map(chatResponses -> {
-            if (chatResponses.isEmpty()) {
-                return promptMessage;
-            }
-            final StringBuilder titleBuilder = new StringBuilder();
-            for (ChatResponse chatResponse : chatResponses) {
-                titleBuilder.append(chatResponse.getResult().getOutput().getText());
-            }
-            return titleBuilder.toString();
-        });
+                .collectList()
+                .map(chatResponses -> {
+                    if (chatResponses.isEmpty()) {
+                        return promptMessage;
+                    }
+                    final StringBuilder titleBuilder = new StringBuilder();
+                    for (ChatResponse chatResponse : chatResponses) {
+                        titleBuilder.append(chatResponse.getResult().getOutput().getText());
+                    }
+                    return titleBuilder.toString();
+                })
+                .onErrorMap(error -> {
+                    log.error("Error generating title prompt", error);
+                    return new AIServiceException("Ollama", "Failed to generate conversation title", error);
+                });
     }
 
     @Override
     public Flux<String> streamAnswer(String conversationId, ConversationRequest request) {
         log.info("(streamAnswer)conversationId : {}, request : {}", conversationId, request);
         return conversationService.findConversationModel(conversationId)
+                .onErrorResume(ResourceNotFoundException.class, error -> {
+                    log.error("Conversation not found: {}", conversationId);
+                    return Mono.error(error);
+                })
                 .flatMap(model ->
                         conversationService.generateContextWindow(conversationId, model, request.getPromptMessage())
                 )
                 .publishOn(Schedulers.boundedElastic())
                 .flatMapMany(
                         modelContextWindow -> {
-                            Flux<String> chatStreamResp =
-                                    chatStreamRegistry.getChatStreamService(modelContextWindow.getModel())
-                                            .streamAnswer(modelContextWindow.getMessages());
+                            try {
+                                Flux<String> chatStreamResp =
+                                        chatStreamRegistry.getChatStreamService(modelContextWindow.getModel())
+                                                .streamAnswer(modelContextWindow.getMessages());
 
-                            Flux<String> chatStreamMulticast = chatStreamResp.publish().refCount(2);
+                                Flux<String> chatStreamMulticast = chatStreamResp.publish().refCount(2);
 
-                            chatStreamMulticast
-                                    .reduce(new StringBuilder(), StringBuilder::append)
-                                    .flatMap(answer ->
-                                            conversationService.saveMessage(conversationId,
-                                                    request.getPromptMessage(),
-                                                    answer.toString())).subscribeOn(Schedulers.boundedElastic())
-                                    .subscribe();
+                                chatStreamMulticast
+                                        .reduce(new StringBuilder(), StringBuilder::append)
+                                        .flatMap(answer ->
+                                                conversationService.saveMessage(conversationId,
+                                                        request.getPromptMessage(),
+                                                        answer.toString())).subscribeOn(Schedulers.boundedElastic())
+                                        .subscribe();
 
-                            return chatStreamMulticast;
+                                return chatStreamMulticast;
+                            } catch (Exception e) {
+                                log.error("Error streaming answer", e);
+                                return Flux.error(new AIServiceException(
+                                        modelContextWindow.getModel(),
+                                        "Failed to stream AI response",
+                                        e));
+                            }
                         }
-                );
+                )
+                .onErrorResume(error -> {
+                    if (error instanceof ResourceNotFoundException || error instanceof AIServiceException) {
+                        return Flux.error(error);
+                    }
+                    log.error("Unexpected error in stream answer", error);
+                    return Flux.error(new AIServiceException("Chat Service", "Failed to stream answer", error));
+                });
     }
 }
