@@ -1,0 +1,17 @@
+spring:
+  ai:
+    openai:
+      api-key: ${DEEPSEEK_API_KEY}
+      base-url: https://api.deepseek.com
+      chat:
+        options:
+          model: deepseek-chat
+    ollama:
+      base-url: http://localhost:11434
+  cassandra:
+    username: cassandra
+    password: cassandra
+    contact-points: localhost
+    schema-action: none
+    local-datacenter: datacenter1
+    port: 9042

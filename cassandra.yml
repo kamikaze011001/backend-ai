@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  cassandra:
+    image: cassandra:5.0.3
+    ports:
+      - "9042:9042"
+    environment:
+      - CASSANDRA_CLUSTER_NAME=ai_cassandra_cluster
+      - CASSANDRA_DC=datacenter1
+      - CASSANDRA_AUTHENTICATOR=PasswordAuthenticator
+      - CASSANDRA_AUTHORIZER=CassandraAuthorizer
+      - CASSANDRA_USERNAME=cassandra
+      - CASSANDRA_PASSWORD=cassandra
+      - CASSANDRA_KEYSPACE=backend_ai
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: cqlsh -u ${CASSANDRA_USERNAME} -p ${CASSANDRA_PASSWORD} -e describe keyspaces
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  cassandra-data:
+    driver: local
